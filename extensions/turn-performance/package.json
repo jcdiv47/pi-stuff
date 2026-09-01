@@ -1,0 +1,14 @@
+{
+	"name": "pi-turn-performance",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"benchmark:openrouter": "node --experimental-strip-types benchmark-openrouter.ts",
+		"test": "node --experimental-strip-types --test metrics.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
+	}
+}
