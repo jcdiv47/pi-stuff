@@ -11,5 +11,9 @@
       "extensions/*.ts",
       "extensions/*/index.ts"
     ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }
