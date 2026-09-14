@@ -1,6 +1,9 @@
 export type StreamContentKind = "text" | "thinking" | "tool";
 
 export interface UsageLike {
+	input?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
 	output?: number;
 	reasoning?: number;
 }
@@ -9,6 +12,7 @@ export interface AssistantMessageLike {
 	role: string;
 	content?: unknown;
 	usage?: UsageLike;
+	stopReason?: string;
 }
 
 export interface TurnSnapshot {
@@ -18,19 +22,22 @@ export interface TurnSnapshot {
 	firstTextAt?: number;
 	lastActivityAt?: number;
 	estimatedStreamTokens: number;
+	estimatedTokensAfterFirstChunk: number;
+	ttftIsUpperBound: boolean;
 	sawThinkingActivity: boolean;
 }
 
 export interface TurnResult extends TurnSnapshot {
 	messageEndedAt: number;
 	ttftMs?: number;
-	ttftIsUpperBound: boolean;
 	timeToTextMs?: number;
 	outputTokens: number;
 	outputTokensEstimated: boolean;
 	reasoningTokens?: number;
 	reasoningTokensEstimated: boolean;
 	tokensPerSecond?: number;
+	inputTokensPerSecond?: number;
+	stopReason?: string;
 	/**
 	 * Hidden reasoning has no observable first-token event. In that case the
 	 * only provider-neutral rate is output tokens over the whole request.
@@ -88,22 +95,33 @@ export function estimateTokensFromChars(chars: number): number {
 
 export class TurnMetrics {
 	readonly turnIndex: number;
-	readonly requestStartedAt: number;
+	private requestStartedAtValue: number;
 
 	private firstActivityAtValue?: number;
 	private firstTextAtValue?: number;
 	private lastActivityAtValue?: number;
 	private streamedChars = 0;
+	private firstChunkChars = 0;
 	private sawThinkingActivityValue = false;
 	private firstActivityIsUpperBound = false;
 
 	constructor(turnIndex: number, requestStartedAt: number) {
 		this.turnIndex = turnIndex;
-		this.requestStartedAt = requestStartedAt;
+		this.requestStartedAtValue = requestStartedAt;
+	}
+
+	get requestStartedAt(): number {
+		return this.requestStartedAtValue;
+	}
+
+	/** Prefer the provider boundary; retain turn_start for providers without it. */
+	recordRequestStart(at: number): void {
+		if (this.firstActivityAtValue === undefined) this.requestStartedAtValue = at;
 	}
 
 	recordActivity(kind: StreamContentKind, delta: string, at: number): void {
 		if (!delta) return;
+		if (this.streamedChars === 0) this.firstChunkChars = delta.length;
 		this.firstActivityAtValue ??= at;
 		this.lastActivityAtValue = at;
 		this.streamedChars += delta.length;
@@ -130,13 +148,17 @@ export class TurnMetrics {
 			firstTextAt: this.firstTextAtValue,
 			lastActivityAt: this.lastActivityAtValue,
 			estimatedStreamTokens: estimateTokensFromChars(this.streamedChars),
+			estimatedTokensAfterFirstChunk: (this.streamedChars - this.firstChunkChars) / CHARS_PER_ESTIMATED_TOKEN,
+			ttftIsUpperBound: this.firstActivityIsUpperBound,
 			sawThinkingActivity: this.sawThinkingActivityValue,
 		};
 	}
 
 	finish(message: AssistantMessageLike, messageEndedAt: number): TurnResult {
 		const counts = countMessageContent(message.content);
-		const estimatedOutput = estimateTokensFromChars(counts.textChars + counts.thinkingChars + counts.toolChars);
+		const estimatedOutput = estimateTokensFromChars(
+			Math.max(this.streamedChars, counts.textChars + counts.thinkingChars + counts.toolChars),
+		);
 		const estimatedReasoning = estimateTokensFromChars(counts.thinkingChars);
 		const reportedOutput = finiteNonNegative(message.usage?.output);
 		const reportedReasoning = finiteNonNegative(message.usage?.reasoning);
@@ -168,9 +190,26 @@ export class TurnMetrics {
 		const hiddenReasoning = (reportedReasoning ?? 0) > 0 && !this.sawThinkingActivityValue;
 		const effectiveRate = hiddenReasoning || ttftIsUpperBound || firstActivityAt === undefined;
 		const rateStartedAt = !effectiveRate && firstActivityAt !== undefined ? firstActivityAt : this.requestStartedAt;
-		const rateDurationMs = Math.max(0, messageEndedAt - rateStartedAt);
+		// Usage-only trailers and stream teardown are not decode time. Hidden or
+		// unobservable generation still needs the whole-request effective rate.
+		const rateEndedAt = effectiveRate ? messageEndedAt : (this.lastActivityAtValue ?? messageEndedAt);
+		const rateDurationMs = Math.max(0, rateEndedAt - rateStartedAt);
+		// Reported usage uses the conventional N-1 token interval. A delta may
+		// contain multiple tokens, so this remains client-observed, not GPU TPS.
+		// With estimated usage we can instead exclude the entire first chunk.
+		const rateTokens = effectiveRate
+			? outputTokens
+			: outputIsUsable
+				? Math.max(0, outputTokens - 1)
+				: this.snapshot().estimatedTokensAfterFirstChunk;
 		const tokensPerSecond =
-			outputTokens > 0 && rateDurationMs >= 10 ? outputTokens / (rateDurationMs / 1000) : undefined;
+			rateTokens > 0 && rateDurationMs >= 10 ? rateTokens / (rateDurationMs / 1000) : undefined;
+		const processedInput =
+			(finiteNonNegative(message.usage?.input) ?? 0) + (finiteNonNegative(message.usage?.cacheWrite) ?? 0);
+		const inputTokensPerSecond =
+			processedInput > 0 && ttftMs !== undefined && ttftMs > 0 && !ttftIsUpperBound
+				? processedInput / (ttftMs / 1000)
+				: undefined;
 
 		return {
 			...this.snapshot(),
@@ -185,6 +224,8 @@ export class TurnMetrics {
 			reasoningTokens,
 			reasoningTokensEstimated: reasoningTokens !== undefined && !reasoningIsUsable,
 			tokensPerSecond,
+			inputTokensPerSecond,
+			stopReason: message.stopReason,
 			effectiveRate,
 		};
 	}
@@ -209,18 +250,24 @@ export function formatWaitingStatus(elapsedMs: number): string {
 	return `TTFT ${formatDuration(Math.max(0, elapsedMs))}\u2026`;
 }
 
-export function formatStreamingStatus(snapshot: TurnSnapshot, now: number): string {
+export interface DisplayOptions {
+	compact?: boolean;
+	showInputRate?: boolean;
+}
+
+export function formatStreamingStatus(snapshot: TurnSnapshot, now: number, options: DisplayOptions = {}): string {
 	if (snapshot.firstActivityAt === undefined) return formatWaitingStatus(now - snapshot.requestStartedAt);
-	const parts = [`TTFT ${formatDuration(snapshot.firstActivityAt - snapshot.requestStartedAt)}`];
-	const durationMs = now - snapshot.firstActivityAt;
-	if (snapshot.estimatedStreamTokens > 0 && durationMs >= 10) {
-		parts.push(`~${formatRate(snapshot.estimatedStreamTokens / (durationMs / 1000))} tok/s`);
+	const ttft = formatDuration(snapshot.firstActivityAt - snapshot.requestStartedAt);
+	const parts = [`TTFT ${snapshot.ttftIsUpperBound ? "\u2264" : ""}${ttft}`];
+	const durationMs = (snapshot.lastActivityAt ?? snapshot.firstActivityAt) - snapshot.firstActivityAt;
+	if (!snapshot.ttftIsUpperBound && snapshot.estimatedTokensAfterFirstChunk > 0 && durationMs >= 10) {
+		parts.push(`~${formatRate(snapshot.estimatedTokensAfterFirstChunk / (durationMs / 1000))} tok/s`);
 	}
-	if (snapshot.sawThinkingActivity && snapshot.firstTextAt === undefined) parts.push("thinking");
+	if (!options.compact && snapshot.sawThinkingActivity && snapshot.firstTextAt === undefined) parts.push("thinking");
 	return parts.join(" \u00b7 ");
 }
 
-export function formatFinalStatus(result: TurnResult): string {
+export function formatFinalStatus(result: TurnResult, options: DisplayOptions = {}): string {
 	const parts: string[] = [];
 	if (result.ttftMs !== undefined) {
 		parts.push(`TTFT ${result.ttftIsUpperBound ? "\u2264" : ""}${formatDuration(result.ttftMs)}`);
@@ -229,6 +276,7 @@ export function formatFinalStatus(result: TurnResult): string {
 	}
 
 	if (
+		!options.compact &&
 		result.timeToTextMs !== undefined &&
 		result.ttftMs !== undefined &&
 		result.timeToTextMs - result.ttftMs >= 50
@@ -236,9 +284,17 @@ export function formatFinalStatus(result: TurnResult): string {
 		parts.push(`answer ${formatDuration(result.timeToTextMs)}`);
 	}
 
-	if (result.tokensPerSecond !== undefined) {
-		parts.push(`${result.effectiveRate ? "eff ~" : ""}${formatRate(result.tokensPerSecond)} tok/s`);
+	if (!options.compact && options.showInputRate && result.inputTokensPerSecond !== undefined) {
+		parts.push(`Input/TTFT ~${formatRate(result.inputTokensPerSecond)} tok/s`);
 	}
+	if (result.tokensPerSecond !== undefined) {
+		const prefix = result.effectiveRate ? "eff ~" : result.outputTokensEstimated ? "~" : "";
+		parts.push(`${prefix}${formatRate(result.tokensPerSecond)} tok/s`);
+	} else {
+		parts.push("tok/s \u2014");
+	}
+	if (result.stopReason === "aborted" || result.stopReason === "error") parts.push(result.stopReason);
+	if (options.compact) return parts.join(" \u00b7 ");
 
 	const outputPrefix = result.outputTokensEstimated ? "~" : "";
 	let tokens = `${outputPrefix}${formatTokens(result.outputTokens)} tok`;

@@ -5,20 +5,30 @@ import {
 	TurnMetrics,
 	type AssistantMessageLike,
 	type StreamContentKind,
+	type TurnResult,
+	type DisplayOptions,
 } from "./metrics.ts";
 
 const STATUS_KEY = "turn-performance";
 const REFRESH_MS = 250;
 
 interface ExtensionContextLike {
+	hasUI: boolean;
 	ui: {
 		setStatus(key: string, text: string | undefined): void;
+		notify(message: string, type: "info"): void;
 		theme: { fg(color: string, text: string): string };
 	};
 }
 
 interface ExtensionApiLike {
 	on(event: string, handler: (event: any, ctx: ExtensionContextLike) => void | Promise<void>): void;
+	registerFlag(name: string, options: { description: string; type: "boolean"; default: boolean }): void;
+	getFlag(name: string): string | boolean | undefined;
+	registerCommand(name: string, options: {
+		description: string;
+		handler: (args: string, ctx: ExtensionContextLike) => Promise<void>;
+	}): void;
 }
 
 function now(): number {
@@ -49,13 +59,14 @@ function streamDelta(event: unknown): { kind: StreamContentKind; delta: string }
 
 function completionKind(event: unknown): StreamContentKind | undefined {
 	if (!event || typeof event !== "object") return undefined;
-	switch ((event as { type?: unknown }).type) {
+	const update = event as { type?: unknown; content?: unknown; toolCall?: unknown };
+	switch (update.type) {
 		case "text_end":
-			return "text";
+			return typeof update.content === "string" && update.content.length > 0 ? "text" : undefined;
 		case "thinking_end":
-			return "thinking";
+			return typeof update.content === "string" && update.content.length > 0 ? "thinking" : undefined;
 		case "toolcall_end":
-			return "tool";
+			return update.toolCall ? "tool" : undefined;
 		default:
 			return undefined;
 	}
@@ -65,9 +76,33 @@ export default function turnPerformanceExtension(pi: ExtensionApiLike): void {
 	let active: TurnMetrics | undefined;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 	let lastRenderedAt = 0;
+	let lastResult: TurnResult | undefined;
+	const display: DisplayOptions = {};
+
+	pi.registerFlag("turn-performance-compact", {
+		description: "Show only TTFT and throughput in the performance status",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("turn-performance-input-rate", {
+		description: "Show approximate Input/TTFT (not server prefill throughput)",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerCommand("turn-performance-compact", {
+		description: "Toggle compact TTFT and throughput status",
+		handler: async (_args, ctx) => {
+			display.compact = !display.compact;
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Turn performance: compact mode ${display.compact ? "on" : "off"}`, "info");
+			}
+			if (active) paint(ctx, formatStreamingStatus(active.snapshot(), now(), display));
+			else if (lastResult) paint(ctx, formatFinalStatus(lastResult, display));
+		},
+	});
 
 	function paint(ctx: ExtensionContextLike, text: string): void {
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", text));
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("dim", text));
 	}
 
 	function stopRefresh(): void {
@@ -77,6 +112,7 @@ export default function turnPerformanceExtension(pi: ExtensionApiLike): void {
 
 	function startRefresh(ctx: ExtensionContextLike): void {
 		stopRefresh();
+		if (!ctx.hasUI) return;
 		refreshTimer = setInterval(() => {
 			if (!active) return;
 			const at = now();
@@ -85,7 +121,7 @@ export default function turnPerformanceExtension(pi: ExtensionApiLike): void {
 				ctx,
 				snapshot.firstActivityAt === undefined
 					? formatWaitingStatus(at - snapshot.requestStartedAt)
-					: formatStreamingStatus(snapshot, at),
+					: formatStreamingStatus(snapshot, at, display),
 			);
 			lastRenderedAt = at;
 		}, REFRESH_MS);
@@ -96,22 +132,41 @@ export default function turnPerformanceExtension(pi: ExtensionApiLike): void {
 		const assistant = assistantMessage(message);
 		if (!active || !assistant) return;
 		stopRefresh();
-		paint(ctx, formatFinalStatus(active.finish(assistant, now())));
+		lastResult = active.finish(assistant, now());
+		paint(ctx, formatFinalStatus(lastResult, display));
 		active = undefined;
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	function reset(ctx: ExtensionContextLike): void {
 		stopRefresh();
 		active = undefined;
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		lastResult = undefined;
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		reset(ctx);
+		display.compact = pi.getFlag("turn-performance-compact") === true;
+		display.showInputRate = pi.getFlag("turn-performance-input-rate") === true;
+	});
+	pi.on("session_tree", (_event, ctx) => reset(ctx));
+	pi.on("model_select", (_event, ctx) => {
+		// An in-flight result still belongs to the old model; don't lose timing.
+		if (!active) reset(ctx);
 	});
 
 	pi.on("turn_start", (event, ctx) => {
 		const startedAt = now();
+		lastResult = undefined;
 		active = new TurnMetrics(typeof event.turnIndex === "number" ? event.turnIndex : 0, startedAt);
 		lastRenderedAt = startedAt;
 		paint(ctx, formatWaitingStatus(0));
 		startRefresh(ctx);
+	});
+
+	pi.on("before_provider_request", () => {
+		// Observe only: returning anything would replace the provider payload.
+		active?.recordRequestStart(now());
 	});
 
 	pi.on("message_update", (event, ctx) => {
@@ -126,18 +181,20 @@ export default function turnPerformanceExtension(pi: ExtensionApiLike): void {
 
 		// Streaming events can arrive much faster than the TUI should redraw.
 		if (at - lastRenderedAt >= REFRESH_MS) {
-			paint(ctx, formatStreamingStatus(active.snapshot(), at));
+			paint(ctx, formatStreamingStatus(active.snapshot(), at, display));
 			lastRenderedAt = at;
 		}
 	});
 
 	pi.on("message_end", (event, ctx) => finish(event.message, ctx));
 	// Defensive fallback for providers/runtimes that omit assistant message_end.
-	pi.on("turn_end", (event, ctx) => finish(event.message, ctx));
-
-	pi.on("session_shutdown", (_event, ctx) => {
-		stopRefresh();
-		active = undefined;
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+	pi.on("turn_end", (event, ctx) => {
+		finish(event.message, ctx);
+		if (active) reset(ctx);
 	});
+	pi.on("agent_end", (_event, ctx) => {
+		// Abort/failure before message_end must not leave a ticking waiting label.
+		if (active) reset(ctx);
+	});
+	pi.on("session_shutdown", (_event, ctx) => reset(ctx));
 }
